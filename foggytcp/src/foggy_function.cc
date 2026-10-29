@@ -40,6 +40,25 @@ void on_recv_pkt(foggy_socket_t *sock, uint8_t *pkt) {
   foggy_tcp_header_t *hdr = (foggy_tcp_header_t *)pkt;
   uint8_t flags = get_flags(hdr);
 
+  if (flags & FIN_FLAG_MASK) {
+    // FIN follows the last data byte and consumes one sequence number.
+    if (get_payload_len(pkt) == 0 && get_seq(hdr) == sock->window.next_seq_expected) {
+      sock->peer_closed = 1;
+      uint8_t *ack = create_packet(sock->my_port, ntohs(sock->conn.sin_port),
+          sock->window.last_byte_sent, sock->window.next_seq_expected + 1,
+          sizeof(foggy_tcp_header_t), sizeof(foggy_tcp_header_t), ACK_FLAG_MASK,
+          MAX_NETWORK_BUFFER, 0, NULL, NULL, 0);
+      if (ack) {
+        sendto(sock->socket, ack, sizeof(foggy_tcp_header_t), 0,
+               reinterpret_cast<sockaddr *>(&sock->conn), sizeof(sock->conn));
+        free(ack);
+      }
+      pthread_cond_broadcast(&sock->wait_cond);
+    }
+    return;
+  }
+
+
   switch (flags) {
     case ACK_FLAG_MASK: {
       uint32_t ack = get_ack(hdr);
@@ -48,14 +67,17 @@ void on_recv_pkt(foggy_socket_t *sock, uint8_t *pkt) {
       // if (get_payload_len(pkt) == 0) handle_congestion_window(sock, pkt);
       sock->window.advertised_window = get_advertised_window(hdr);
 
-      if (after(ack, sock->window.last_ack_received)) {
+      if (sock->fin_sent && ack == sock->window.last_byte_sent + 1)
+        sock->fin_acked = 1;
+      if (!after(ack, sock->window.last_byte_sent) &&
+          after(ack, sock->window.last_ack_received)) {
         sock->window.last_ack_received = ack;
       }
     }
 
     // Fallthrough.
     default: {
-      if (get_payload_len(pkt) > 0) {
+      if (get_payload_len(pkt) > 0 && !sock->peer_closed) {
         debug_printf("Received data packet %d %d\n", get_seq(hdr),
                      get_seq(hdr) + get_payload_len(pkt));
 
@@ -97,7 +119,7 @@ void send_pkts(foggy_socket_t *sock, uint8_t *data, int buf_len) {
     while (buf_len != 0) {
       uint16_t payload_len = MIN(buf_len, (int)MSS);
 
-      send_window_slot_t slot;
+      send_window_slot_t slot{};
       slot.is_sent = 0;
       slot.msg = create_packet(
           sock->my_port, ntohs(sock->conn.sin_port),
@@ -119,6 +141,8 @@ void send_pkts(foggy_socket_t *sock, uint8_t *data, int buf_len) {
 
 void add_receive_window(foggy_socket_t *sock, uint8_t *pkt) {
   foggy_tcp_header_t *hdr = (foggy_tcp_header_t *)pkt;
+  // Stop-and-wait: duplicate/out-of-order data must not occupy the sole slot.
+  if (get_seq(hdr) != sock->window.next_seq_expected) return;
 
   // Stop-and-wait implementation
   // Insert the packet into the first place of receive window
@@ -163,14 +187,18 @@ void transmit_send_window(foggy_socket_t *sock) {
   // If it has been sent but not ACKed, skip.
   send_window_slot_t& slot = sock->send_window.front();
   foggy_tcp_header_t *hdr = (foggy_tcp_header_t *)slot.msg;
-  if (slot.is_sent){
-    return;
-  } else {
-    debug_printf("Sending packet %d %d\n", get_seq(hdr),
-                   get_seq(hdr) + get_payload_len(slot.msg));
+  if (slot.is_sent) {
+    timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t elapsed = (now.tv_sec - slot.send_time.tv_sec) * 1000 +
+                      (now.tv_nsec - slot.send_time.tv_nsec) / 1000000;
+    if (elapsed < slot.timeout_interval) return;
+  }
+  if (sendto(sock->socket, slot.msg, get_plen(hdr), 0,
+             reinterpret_cast<sockaddr *>(&sock->conn), sizeof(sock->conn)) >= 0) {
     slot.is_sent = 1;
-    sendto(sock->socket, slot.msg, get_plen(hdr), 0,
-            (struct sockaddr *)&(sock->conn), sizeof(sock->conn));
+    slot.timeout_interval = 100;
+    clock_gettime(CLOCK_MONOTONIC, &slot.send_time);
   }
 }
 
@@ -185,7 +213,11 @@ void receive_send_window(foggy_socket_t *sock) {
     if (slot.is_sent == 0) {
       break;
     }
-    if (has_been_acked(sock, get_seq(hdr)) == 0) {
+    pthread_mutex_lock(&sock->window.ack_lock);
+    uint32_t ack = sock->window.last_ack_received;
+    pthread_mutex_unlock(&sock->window.ack_lock);
+    // Release only after the entire packet is acknowledged.
+    if (before(ack, get_seq(hdr) + get_payload_len(slot.msg))) {
       break;
     }
     sock->send_window.pop_front();

@@ -56,3 +56,8 @@ The following files have been provided for you:
 * `capture_packets.sh`: Captures packets from the server and client containers and saves them to a PCAP file.
 
 * `tcp.lua`: A Lua plugin that allows Wireshark to decode foggy-TCP headers. Copy the file to the directory described in <https://www.wireshark.org/docs/wsug_html_chunked/ChPluginFolders.html> to use the plugin.
+
+## Single-session lifecycle repair
+
+This branch repairs peer pinning and FIN/EOF handling without changing the four
+public function declarations. See [behavior, tests, and limits](docs/single-session-lifecycle.md).

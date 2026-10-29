@@ -18,6 +18,7 @@ from releasing their forks in any public places. */
 
 
 #include <assert.h>
+#include <chrono>
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -60,97 +61,92 @@ int has_been_acked(foggy_socket_t *sock, uint32_t seq) {
  * Check `foggy_read_mode_t` for more information.
  */
 void check_for_pkt(foggy_socket_t *sock, foggy_read_mode_t flags) {
-  foggy_tcp_header_t hdr;
-  uint8_t *pkt;
-  socklen_t conn_len = sizeof(sock->conn);
-  ssize_t len = 0;
-  uint32_t plen = 0, buf_size = 0, n = 0;
+  uint8_t packet[MAX_LEN];
+  sockaddr_in source{};
+  socklen_t length = sizeof(source);
+  ssize_t n = recvfrom(sock->socket, packet, sizeof(packet),
+                       flags == NO_WAIT ? MSG_DONTWAIT : 0,
+                       reinterpret_cast<sockaddr *>(&source), &length);
+  if (n < static_cast<ssize_t>(sizeof(foggy_tcp_header_t))) return;
+  auto *header = reinterpret_cast<foggy_tcp_header_t *>(packet);
+  if (ntohl(header->identifier) != IDENTIFIER ||
+      get_hlen(header) < sizeof(foggy_tcp_header_t) ||
+      get_hlen(header) > get_plen(header) || get_plen(header) != n) return;
 
-  while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
-  }
-  switch (flags) {
-    case NO_FLAG:
-      len = recvfrom(sock->socket, &hdr, sizeof(foggy_tcp_header_t), MSG_PEEK,
-                     (struct sockaddr *)&(sock->conn), &conn_len);
-      break;
-
-    // Fallthrough.
-    case NO_WAIT:
-      len = recvfrom(sock->socket, &hdr, sizeof(foggy_tcp_header_t),
-                     MSG_DONTWAIT | MSG_PEEK, (struct sockaddr *)&(sock->conn),
-                     &conn_len);
-      break;
-
-    default:
-      perror("ERROR unknown flag");
-  }
-  if (len >= (ssize_t)sizeof(foggy_tcp_header_t)) {
-    plen = get_plen(&hdr);
-    pkt = (uint8_t*) malloc(plen);
-    while (buf_size < plen) {
-      n = recvfrom(sock->socket, pkt + buf_size, plen - buf_size, 0,
-                   (struct sockaddr *)&(sock->conn), &conn_len);
-      buf_size = buf_size + n;
+  pthread_mutex_lock(&sock->recv_lock);
+  if (!sock->peer_set) {
+    // Bind only on the first data packet, never on a stale ACK or FIN.
+    if (get_plen(header) == get_hlen(header) || get_seq(header) != 0 ||
+        (get_flags(header) & FIN_FLAG_MASK)) {
+      pthread_mutex_unlock(&sock->recv_lock);
+      return;
     }
-    on_recv_pkt(sock, pkt);
-    free(pkt);
+    sock->conn = source;
+    sock->peer_set = 1;
+  } else if (source.sin_addr.s_addr != sock->conn.sin_addr.s_addr ||
+             source.sin_port != sock->conn.sin_port) {
+    fprintf(stderr, "IGNORED_PEER %u\n", ntohs(source.sin_port));
+    pthread_mutex_unlock(&sock->recv_lock);
+    return;
   }
-  pthread_mutex_unlock(&(sock->recv_lock));
+  on_recv_pkt(sock, packet);
+  if (sock->received_len > 0 || sock->peer_closed)
+    pthread_cond_broadcast(&sock->wait_cond);
+  pthread_mutex_unlock(&sock->recv_lock);
+}
+
+static void send_fin(foggy_socket_t *sock) {
+  auto *packet = create_packet(sock->my_port, ntohs(sock->conn.sin_port),
+      sock->window.last_byte_sent, sock->window.next_seq_expected,
+      sizeof(foggy_tcp_header_t), sizeof(foggy_tcp_header_t),
+      FIN_FLAG_MASK | ACK_FLAG_MASK, MAX_NETWORK_BUFFER, 0, NULL, NULL, 0);
+  if (!packet) return;
+  sock->fin_sent = 1;
+  sendto(sock->socket, packet, sizeof(foggy_tcp_header_t), 0,
+         reinterpret_cast<sockaddr *>(&sock->conn), sizeof(sock->conn));
+  free(packet);
 }
 
 void *begin_backend(void *in) {
-  foggy_socket_t *sock = (foggy_socket_t *)in;
-  int death, buf_len, send_signal;
-  uint8_t *data;
+  auto *sock = static_cast<foggy_socket_t *>(in);
+  using Clock = std::chrono::steady_clock;
+  auto closing = Clock::time_point{};
+  auto last_fin = Clock::time_point{};
+  auto acknowledged = Clock::time_point{};
+  for (;;) {
+    pthread_mutex_lock(&sock->death_lock);
+    bool death = sock->dying;
+    pthread_mutex_unlock(&sock->death_lock);
+    auto now = Clock::now();
+    if (death && closing == Clock::time_point{}) closing = now;
+    if (death && now - closing >= std::chrono::seconds(2)) break;
 
-  while (1) {
-    while (pthread_mutex_lock(&(sock->death_lock)) != 0) {
-    }
-    death = sock->dying;
-    pthread_mutex_unlock(&(sock->death_lock));
-
-    while (pthread_mutex_lock(&(sock->send_lock)) != 0) {
-    }
-    buf_len = sock->sending_len;
-
-    if (!sock->send_window.empty()) {
-      // printf("Sending window is not empty\n");
-      send_pkts(sock, NULL, 0);
-      check_for_pkt(sock, NO_WAIT);
-    }
-
-    if (death && buf_len == 0 && sock->send_window.empty()) {
-      break;
-    }
-
-    if (buf_len > 0) {
-      
-      data = (uint8_t*)malloc(buf_len);
-      memcpy(data, sock->sending_buf, buf_len);
-      sock->sending_len = 0;
-      free(sock->sending_buf);
-      sock->sending_buf = NULL;
-      pthread_mutex_unlock(&(sock->send_lock));
-      send_pkts(sock, data, buf_len);
-      free(data);
-    } else {
-      pthread_mutex_unlock(&(sock->send_lock));
-    }
-
+    pthread_mutex_lock(&sock->send_lock);
+    int count = sock->sending_len;
+    uint8_t *data = sock->sending_buf;
+    sock->sending_len = 0;
+    sock->sending_buf = NULL;
+    pthread_mutex_unlock(&sock->send_lock);
+    // The backend alone owns the send/receive windows.
+    send_pkts(sock, data, count);
+    free(data);
     check_for_pkt(sock, NO_WAIT);
 
-    while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
+    if (death && count == 0 && sock->send_window.empty()) {
+      if (!sock->peer_set) break;
+      now = Clock::now();
+      if (!sock->fin_acked &&
+          (last_fin == Clock::time_point{} || now - last_fin >= std::chrono::milliseconds(100))) {
+        send_fin(sock);
+        last_fin = now;
+      }
+      if (sock->fin_acked) {
+        if (acknowledged == Clock::time_point{}) acknowledged = now;
+        // Briefly keep ACKing the peer's FIN, including retransmissions.
+        if (now - acknowledged >= std::chrono::milliseconds(200)) break;
+      }
     }
-
-    send_signal = sock->received_len > 0;
-
-    pthread_mutex_unlock(&(sock->recv_lock));
-
-    if (send_signal) {
-      pthread_cond_signal(&(sock->wait_cond));
-    }
+    usleep(1000);
   }
-
-  pthread_exit(NULL);
   return NULL;
 }

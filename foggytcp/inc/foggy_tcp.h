@@ -93,6 +93,11 @@ struct foggy_socket_t {
   int sending_len;
   foggy_socket_type_t type;
   pthread_mutex_t send_lock;
+  // Internal single-session state; the four public API declarations are unchanged.
+  int peer_set;
+  int peer_closed;
+  int fin_sent;
+  int fin_acked;
   int dying;
   pthread_mutex_t death_lock;
   window_t window;

@@ -48,6 +48,10 @@ void* foggy_socket(const foggy_socket_type_t socket_type,
 
   sock->type = socket_type;
   sock->dying = 0;
+  sock->peer_set = socket_type == TCP_INITIATOR;
+  sock->peer_closed = 0;
+  sock->fin_sent = 0;
+  sock->fin_acked = 0;
   pthread_mutex_init(&(sock->death_lock), NULL);
 
   // FIXME: Sequence numbers should be randomly initialized. The next expected
@@ -90,7 +94,7 @@ void* foggy_socket(const foggy_socket_type_t socket_type,
       my_addr.sin_family = AF_INET;
       my_addr.sin_addr.s_addr = htonl(INADDR_ANY);
       my_addr.sin_port = 0;
-      if (bind(sockfd, (struct sockaddr *)&my_addr, sizeof(my_addr)) < 0) {
+      if (::bind(sockfd, (struct sockaddr *)&my_addr, sizeof(my_addr)) < 0) {
         perror("ERROR on binding");
         return NULL;
       }
@@ -106,7 +110,7 @@ void* foggy_socket(const foggy_socket_type_t socket_type,
       optval = 1;
       setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const void *)&optval,
                  sizeof(int));
-      if (bind(sockfd, (struct sockaddr *)&conn, sizeof(conn)) < 0) {
+      if (::bind(sockfd, (struct sockaddr *)&conn, sizeof(conn)) < 0) {
         perror("ERROR on binding");
         return NULL;
       }
@@ -125,26 +129,27 @@ void* foggy_socket(const foggy_socket_type_t socket_type,
 }
 
 int foggy_close(void *in_sock) {
-  struct foggy_socket_t *sock = (struct foggy_socket_t *)in_sock;
-  while (pthread_mutex_lock(&(sock->death_lock)) != 0) {
-  }
+  auto *sock = static_cast<foggy_socket_t *>(in_sock);
+  if (!sock) return EXIT_ERROR;
+  pthread_mutex_lock(&sock->death_lock);
   sock->dying = 1;
-  pthread_mutex_unlock(&(sock->death_lock));
-
+  pthread_mutex_unlock(&sock->death_lock);
   pthread_join(sock->thread_id, NULL);
 
-  if (sock != NULL) {
-    if (sock->received_buf != NULL) {
-      free(sock->received_buf);
-    }
-    if (sock->sending_buf != NULL) {
-      free(sock->sending_buf);
-    }
-  } else {
-    perror("ERROR null socket\n");
-    return EXIT_ERROR;
-  }
-  return close(sock->socket);
+  // The owner has stopped application reads/writes before releasing the handle.
+  int result = sock->peer_set && !sock->fin_acked ? EXIT_ERROR : EXIT_SUCCESS;
+  if (close(sock->socket) != 0) result = EXIT_ERROR;
+  free(sock->received_buf);
+  free(sock->sending_buf);
+  for (auto &slot : sock->send_window) free(slot.msg);
+  for (auto &slot : sock->receive_window) if (slot.is_used) free(slot.msg);
+  pthread_mutex_destroy(&sock->recv_lock);
+  pthread_mutex_destroy(&sock->send_lock);
+  pthread_mutex_destroy(&sock->death_lock);
+  pthread_mutex_destroy(&sock->window.ack_lock);
+  pthread_cond_destroy(&sock->wait_cond);
+  delete sock;
+  return result;
 }
 
 int foggy_read(void* in_sock, void *buf, int length) {
@@ -152,6 +157,7 @@ int foggy_read(void* in_sock, void *buf, int length) {
   uint8_t *new_buf;
   int read_len = 0;
 
+  if (length == 0) return 0;
   if (length < 0) {
     perror("ERROR negative length");
     return EXIT_ERROR;
@@ -160,7 +166,7 @@ int foggy_read(void* in_sock, void *buf, int length) {
   while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
   }
 
-  while (sock->received_len == 0) {
+  while (sock->received_len == 0 && !sock->peer_closed) {
     pthread_cond_wait(&(sock->wait_cond), &(sock->recv_lock));
   }
   if (sock->received_len > 0) {
