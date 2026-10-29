@@ -60,4 +60,4 @@ The following files have been provided for you:
 ## Single-session lifecycle repair
 
 This branch repairs peer pinning and FIN/EOF handling without changing the four
-public function declarations. See [behavior, tests, and limits](docs/single-session-lifecycle.md).
+public function declarations.
