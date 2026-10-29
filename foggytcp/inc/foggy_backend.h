@@ -20,7 +20,7 @@ operations separately from the application. */
 #include "foggy_tcp.h"
 
 /**
- * Launches the CMU-TCP backend.
+ * Launches the Foggy-TCP backend.
  *
  * @param in the socket to be used for backend processing.
  */

@@ -139,7 +139,7 @@ void* foggy_socket(const foggy_socket_type_t socket_type,
                const char* port, const char* server_ip);
 
 /**
- * Closes a CMU-TCP socket.
+ * Closes a Foggy-TCP socket.
  *
  * @param sock The socket to close.
  *
@@ -148,7 +148,7 @@ void* foggy_socket(const foggy_socket_type_t socket_type,
 int foggy_close(void* sock);
 
 /**
- * Reads data from a CMU-TCP socket.
+ * Reads data from a Foggy-TCP socket.
  *
  * If there is data available in the socket buffer, it is placed in the
  * destination buffer.
@@ -158,14 +158,14 @@ int foggy_close(void* sock);
  * @param length The maximum number of bytes to read.
  * @param flags Flags that determine how the socket should wait for data. Check
  *             `foggy_read_mode_t` for more information. `TIMEOUT` is not
- *             implemented for CMU-TCP.
+ *             implemented for Foggy-TCP.
  *
  * @return The number of bytes read on success, -1 on error.
  */
 int foggy_read(void* sock, void* buf, const int length);
 
 /**
- * Writes data to a CMU-TCP socket.
+ * Writes data to a Foggy-TCP socket.
  *
  * @param sock The socket to write to.
  * @param buf The data to write.

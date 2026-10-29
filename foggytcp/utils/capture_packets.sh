@@ -38,20 +38,20 @@ stop() {
 }
 
 analyze() {
-    tshark -X lua_script:$DIR/tcp.lua -R "cmutcp and not icmp" -r $PCAP_NAME \
+    tshark -X lua_script:$DIR/tcp.lua -R "foggytcp and not icmp" -r $PCAP_NAME \
     -T fields \
     -e frame.time_relative \
     -e ip.src \
-    -e cmutcp.source_port \
+    -e foggytcp.source_port \
     -e ip.dst \
-    -e cmutcp.destination_port \
-    -e cmutcp.seq_num \
-    -e cmutcp.ack_num \
-    -e cmutcp.hlen \
-    -e cmutcp.plen \
-    -e cmutcp.flags \
-    -e cmutcp.advertised_window \
-    -e cmutcp.extension_length \
+    -e foggytcp.destination_port \
+    -e foggytcp.seq_num \
+    -e foggytcp.ack_num \
+    -e foggytcp.hlen \
+    -e foggytcp.plen \
+    -e foggytcp.flags \
+    -e foggytcp.advertised_window \
+    -e foggytcp.extension_length \
     -E header=y -E separator=, \
     -2
 }
